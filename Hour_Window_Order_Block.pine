@@ -1,0 +1,191 @@
+//@version=6
+indicator("Hour Window Order Block", shorttitle = "Hour OB", overlay = true,
+     max_boxes_count = 500)
+
+// One CISD order block per hour, on the chart's own candles.
+// Bullish: inside the window, price trades under the hour open and a candle
+// closes back above it. The box runs from that candle's body top through the
+// lower wick. The upper wick stays outside the box. A candle that trades under
+// the open and closes below it is not bearish. It waits for that close.
+// Bearish: a candle trades above the hour open and does not trade under it,
+// then a later candle closes back below that open. The box runs from that
+// later candle's body bottom through the upper wick.
+//
+// A one-candle reclaim qualifies on its own. A down run can also be reclaimed
+// by a later candle in the same hour; the box is that later candle.
+// The candle that closes through an order block is the breaker. The candle that
+// closes through a breaker is the new order block. The following candle is not
+// used for either one. The next hour removes whatever is still on the chart.
+// A bullish zone gets a buy label under the box. A bearish zone gets a sell
+// label over the box. Hiding an order block hides its label. The label leaves
+// with the zone.
+// Window 0 to 15 is 9:00 inclusive until 9:15 exclusive when the hour is 9.
+
+string GRP_WINDOW = "Hour Window"
+int windowStartMinute = input.int(0, "Window", minval = 0, maxval = 59,
+     group = GRP_WINDOW, inline = "window",
+     tooltip = "Minute within each hour. 0 to 15 marks 9:00 inclusive until 9:15 exclusive when the hour is 9.")
+int windowEndMinute = input.int(15, "to", minval = 1, maxval = 60,
+     group = GRP_WINDOW, inline = "window",
+     tooltip = "Exclusive end minute in the same hour. 15 excludes the candle that opens at minute 15. 60 includes the full hour.")
+
+string GRP_COLORS = "Colors"
+color bullishColor = input.color(color.new(color.rgb(33, 150, 243), 70),
+     "Bullish Order Block", group = GRP_COLORS)
+color bearishColor = input.color(color.new(color.rgb(244, 67, 54), 70),
+     "Bearish Order Block", group = GRP_COLORS)
+
+string GRP_DISPLAY = "Display"
+bool showOrderBlocks = input.bool(true, "Show Order Blocks", group = GRP_DISPLAY,
+     tooltip = "Turn this off to hide order blocks. Breaker blocks stay on the chart.")
+bool showSignals = input.bool(true, "Show buy/sell signals", group = GRP_DISPLAY,
+     tooltip = "Buy sits under a bullish order block or breaker. Sell sits over a bearish one. Hiding an order block hides its signal. A breaker keeps its signal.")
+
+const string NY_TIMEZONE = "America/New_York"
+// Keep this equal to max_boxes_count. Oldest boxes are removed after this many.
+const int MAX_ZONES = 500
+const int PHASE_LOOK = 0
+const int PHASE_ARMED_BULL = 1
+const int PHASE_ARMED_BEAR = 2
+const int PHASE_DONE = 3
+
+if barstate.isfirst and windowStartMinute >= windowEndMinute
+    runtime.error("Window end minute must be later than the window start minute.")
+
+if barstate.isfirst and not timeframe.isintraday
+    runtime.error("Hour Window Order Block reads intraday chart candles. Choose an intraday timeframe.")
+
+// Every candle in the same New York hour shares one key. Subtracting the clock
+// minute and second from the bar timestamp lands on that hour's open instant,
+// including the repeated hour when US daylight saving ends.
+f_hourKey(int t) =>
+    t - (minute(t, NY_TIMEZONE) * 60 + second(t, NY_TIMEZONE)) * 1000
+
+f_inWindow(int t) =>
+    int m = minute(t, NY_TIMEZONE)
+    m >= windowStartMinute and m < windowEndMinute
+
+type OrderBlockZone
+    box zone
+    float top
+    float bottom
+    int createdBar
+    int direction
+    bool active
+    bool breaker
+    label signal
+
+var int activeHourKey = na
+var float hourOpen = na
+var int phase = PHASE_LOOK
+var float seriesOpen = na
+var array<OrderBlockZone> zones = array.new<OrderBlockZone>()
+
+// A comparison with na is na, so the first hour has to be tested with na().
+bool newHour = na(activeHourKey) or f_hourKey(time) != activeHourKey
+if newHour
+    activeHourKey := f_hourKey(time)
+    hourOpen := open
+    // Past hours leave the chart as soon as the next hour opens.
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            OrderBlockZone gone = array.get(zones, i)
+            if not na(gone.zone)
+                box.delete(gone.zone)
+            if not na(gone.signal)
+                label.delete(gone.signal)
+        array.clear(zones)
+
+bool bearishCandle = close < open
+bool bullishCandle = close > open
+bool inWindow = f_inWindow(time)
+bool tookSellSide = low < hourOpen
+bool tookBuySide = high > hourOpen
+bool startedBullish = false
+bool startedBearish = false
+int drawDirection = 0
+bool drawAsBreaker = false
+bool flippedThisBar = false
+
+if barstate.isconfirmed and not na(hourOpen)
+    // A new hour cancels a reclaim that never closed. This bar starts the new hour.
+    if newHour
+        phase := PHASE_LOOK
+    // The candle that closes through the zone is the flipped zone. An order
+    // block becomes a breaker, and a breaker becomes the new order block.
+    if array.size(zones) == 1
+        OrderBlockZone zone = array.get(zones, 0)
+        if zone.active and bar_index > zone.createdBar
+            bool closedThrough = zone.direction == 1 ? close < zone.bottom : close > zone.top
+            if closedThrough
+                flippedThisBar := true
+                drawDirection := zone.direction == 1 ? -1 : 1
+                drawAsBreaker := not zone.breaker
+                phase := PHASE_DONE
+    if not flippedThisBar
+        if phase == PHASE_ARMED_BULL and close > seriesOpen
+            drawDirection := 1
+            phase := PHASE_DONE
+            startedBullish := true
+        else if phase == PHASE_ARMED_BEAR and close < seriesOpen
+            drawDirection := -1
+            phase := PHASE_DONE
+            startedBearish := true
+        else if phase == PHASE_LOOK and inWindow and tookSellSide and close > hourOpen and close > open
+            drawDirection := 1
+            phase := PHASE_DONE
+            startedBullish := true
+        else if phase == PHASE_LOOK and inWindow and tookSellSide
+            // Trading under the hour open is the bullish sweep, even when this
+            // candle also trades above the open and closes down.
+            phase := PHASE_ARMED_BULL
+            seriesOpen := open
+        else if phase == PHASE_LOOK and inWindow and bullishCandle and tookBuySide and not tookSellSide
+            phase := PHASE_ARMED_BEAR
+            seriesOpen := open
+
+if drawDirection != 0
+    // This candle replaces the previous zone, whether it is the OB or the breaker.
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            OrderBlockZone previous = array.get(zones, i)
+            if not na(previous.zone)
+                box.delete(previous.zone)
+            if not na(previous.signal)
+                label.delete(previous.signal)
+        array.clear(zones)
+    // Keep the wick that took the hour open. Leave the other wick outside.
+    float zoneTop = drawDirection == 1 ? math.max(open, close) : high
+    float zoneBottom = drawDirection == 1 ? low : math.min(open, close)
+    color zoneColor = drawDirection == 1 ? bullishColor : bearishColor
+    string zoneLabel = drawAsBreaker ? "BRK" : "OB"
+    // A hidden order block is still tracked so a later close can turn it into a breaker.
+    box created = na
+    if showOrderBlocks or drawAsBreaker
+        created := box.new(left = bar_index, top = zoneTop, right = bar_index + 1,
+             bottom = zoneBottom, xloc = xloc.bar_index, extend = extend.none,
+             border_color = color.new(zoneColor, 0), border_width = 2, bgcolor = zoneColor,
+             text = zoneLabel, text_size = size.small, text_color = color.black,
+             text_halign = text.align_left, text_valign = text.align_top)
+    bool buySide = drawDirection == 1
+    label signalLabel = na
+    if showSignals and (showOrderBlocks or drawAsBreaker)
+        signalLabel := label.new(bar_index, buySide ? zoneBottom : zoneTop,
+             buySide ? "BUY" : "SELL", xloc = xloc.bar_index, yloc = yloc.price,
+             color = color.new(zoneColor, 0),
+             style = buySide ? label.style_label_up : label.style_label_down,
+             textcolor = color.white, size = size.small)
+    array.push(zones, OrderBlockZone.new(created, zoneTop, zoneBottom, bar_index,
+         drawDirection, true, drawAsBreaker, signalLabel))
+
+// A wick back into the zone does not flip it. The box keeps extending.
+if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        OrderBlockZone zone = array.get(zones, i)
+        if not na(zone.zone) and zone.active and bar_index > zone.createdBar
+            box.set_right(zone.zone, bar_index + 1)
+
+alertcondition(startedBullish, title = "Bullish hour-open order block",
+     message = "Bullish CISD order block: price took liquidity under the hour open and closed back above it.")
+alertcondition(startedBearish, title = "Bearish hour-open order block",
+     message = "Bearish CISD order block: price took liquidity above the hour open and closed back below it.")
